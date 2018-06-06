@@ -1,0 +1,193 @@
+#!/usr/bin/env python
+
+# if escalation group in NONE while deployment ,then do not add service.
+
+# --------------------------------------------------------------------------------------------------------
+# Listed import modules
+# --------------------------------------------------------------------------------------------------------
+
+
+import getopt
+import subprocess
+import sys
+import urllib
+import time
+import base64
+import re
+import csv
+import time
+import requests
+from xml.dom import minidom
+import json
+from datetime import date, datetime, timedelta
+import os
+import socket
+import ast
+import ConfigParser
+import splunklib.client as client
+import ssl
+
+try:
+    _create_unverified_https_context = ssl._create_unverified_context
+except AttributeError:
+    # Legacy Python that doesn't verify HTTPS certificates by default
+    pass
+else:
+    # Handle target environment that doesn't support HTTPS verification
+    ssl._create_default_https_context = _create_unverified_https_context
+
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+# GLOBALS:
+scriptname = os.path.basename(sys.argv[0])
+SERVICECMD = "source /usr/local/osmosix/etc/userenv;echo $CMDB_SERVICE_NAME"
+ENVCMD = "source /usr/local/osmosix/etc/userenv;echo $CliqrDepEnvName"
+OWNER = "source /usr/local/osmosix/etc/userenv;echo $SVC_ACCT"
+
+def execute_cmd(cmd):
+    """
+    Executes shell command
+    :param cmd: command to be executed
+    :return: Output from executing command
+    """
+    return subprocess.check_output(str(cmd), shell=True)
+
+def agentSendLogMessage(msg):
+    """
+    Log message at CliQr UI
+    """
+    headers = {'Content-Type': 'text/plain',}
+    requests.post('http://localhost:port/agent/status/message', headers=headers, data=msg)
+
+def main():
+
+    ESCGROUPCMD = "source /usr/local/osmosix/etc/userenv;echo $PD_ESCALATION_GROUP"
+    SPLUNKAPP = execute_cmd(ESCGROUPCMD).rstrip()
+    print("Escalation group: {0}".format(SPLUNKAPP))
+
+
+    if SPLUNKAPP.upper() == "NONE"  or not SPLUNKAPP:
+        print("Exiting script and NOT integrating service with Splunk since user selected NONE at PD_ESCALATION_GROUP while deployment")
+        agentSendLogMessage("splunk_create_alert.py: Exiting script and NOT integrating service with Splunk")
+        raise SystemExit()
+
+    env = username = password = None
+    env = execute_cmd(ENVCMD).rstrip()
+    print("env:{0}".format(env))
+
+    APPNAME = execute_cmd(SERVICECMD).rstrip()
+    ALERTNAME = 'Error Alerts for {0} Service'.format(APPNAME)
+    CMDB_ID = env.rstrip() + '_' + APPNAME.rstrip()  
+    
+
+    # --------------------------------------------------------------------------------------------------------
+    # Create App
+    # --------------------------------------------------------------------------------------------------------
+
+    if SPLUNKAPP.upper() != "NONE":
+        base_url = 'https://' + HOST + ':' + str(PORT)
+        print("Server name: " +  base_url)
+    
+        # Get Session Key
+        sessionResp = requests.post(base_url + '/services/auth/login?output_mode=json', data={'username': SPLUNKUSER, 'password': SPLUNKPWD}, verify=False)
+        sessionData = sessionResp.json()
+        sessionKey = sessionData["sessionKey"]
+        #print sessionKey
+
+        # Set Authorization Header
+        headers = {'Authorization': 'Splunk %s' %sessionKey}
+        
+        # check if app is exist
+        appExistReq = requests.get(base_url + '/services/apps/local/' + SPLUNKAPP , headers=headers, verify=False)
+        appExistResponse = appExistReq.status_code       
+        print("App existance status code: " +  str(appExistResponse))
+        agentSendLogMessage("App existance status code: " +  str(appExistResponse))
+
+        if appExistResponse not in [200,201]: 
+            print("Creating app: " + SPLUNKAPP)
+            datatemp = [
+              ('name', SPLUNKAPP),
+              ('template', 'barebones'),
+            ]
+
+            # Create  new app as per escalation group selection
+            appCreateReq = requests.post(base_url + '/services/apps/local', headers=headers, data=datatemp, verify=False)
+            appCreateResponse = appCreateReq.status_code
+            print("App creation status code: " +  str(appCreateResponse))
+            agentSendLogMessage("App creation status code: " +  str(appCreateResponse))
+            
+            if appCreateResponse not in [200,201]:        
+                print('Not able to create new app - Exiting script')
+                agentSendLogMessage("Exiting splunk_create_alert.py: Not able to create new app")
+                raise SystemExit()
+      
+    # --------------------------------------------------------------------------------------------------------
+    # Input parameters
+    # --------------------------------------------------------------------------------------------------------
+    
+    # Step : Create a search job and alert:
+
+    # Create a Service instance and log in
+    #print('app name: ' + SPLUNKAPP)
+    service = client.connect(host=HOST, port=PORT, app=SPLUNKAPP, username = SPLUNKUSER, password = SPLUNKPWD)
+
+    # Variables
+    myquery = \
+        'index="devops"  sourcetype="{0}*" _index_earliest=-6m@m _index_latest=now (level=ERROR OR level=FATAL) | eval Time=strftime(_time, "%m/%d %H:%M:%S") | eval msg=substr(msg,1, 300) | eval msg= msg . "..." | table  index, Time, msg, exception, source, host,tid | head 10'.format(
+            APPNAME)
+    mysearchname = '{0}'.format(ALERTNAME)
+    a = 0
+
+    # Create the search
+
+    savedsearches = service.saved_searches
+    for savedsearch in savedsearches:
+        if savedsearch.name == ALERTNAME:
+            a = 1
+    if a == 0:
+        mysavedsearch = service.saved_searches.create(mysearchname, myquery)
+
+    # Edit the search
+
+    mysavedsearch = service.saved_searches[ALERTNAME]
+    kwargs = {
+        'description': 'Error Alerts for {0} Service'.format(APPNAME),
+        'is_scheduled': True,
+        'cron_schedule': '*/6 * * * * ',
+        'alert.track': 1,
+        'alert_comparator': 'greater than',
+        'alert_type': 'number of events',
+        'alert_threshold': 0,
+        'alert.severity': 1,
+        'action.email.to': '{0}_splunk_{1}@pagerduty.com'.format(APPNAME, env),
+        'action.email.subject': 'Error alerts for {0} service'.format(APPNAME),
+        'action.email.inline': True,
+        'action.email.format': 'html',
+    }
+
+    mysavedsearch.update(**kwargs).refresh()
+    
+        
+    b = 0
+    savedsearches=None      
+    savedsearches = service.saved_searches
+    for savedsearch in savedsearches:
+        if savedsearch.name == ALERTNAME:
+            b = 1
+            print 'Successfully created Alert: {0}'.format(ALERTNAME) 
+            agentSendLogMessage("splunk_create_alert.py: Successfully created Alert - {0}".format(ALERTNAME)) 
+            print 'Description:         ', mysavedsearch['description']
+            print 'Is scheduled:        ', mysavedsearch['is_scheduled']
+            print 'Cron schedule:       ', mysavedsearch['cron_schedule']
+            print 'Next scheduled time: ', mysavedsearch['next_scheduled_time']
+            print 'Alert track        ', mysavedsearch['alert.track']
+            
+    if b == 0:
+       print 'Not able to create Alert: {0}'.format(ALERTNAME)  
+       agentSendLogMessage("splunk_create_alert.py: Not able to create Alert: {0}".format(ALERTNAME))
+  
+
+
+if __name__ == '__main__':
+    main()
