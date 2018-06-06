@@ -1,0 +1,231 @@
+#!/usr/bin/env python
+
+# if escalation group in NONE while deployment ,then do not add service.
+
+#--------------------------------------------------------------------------------------------------------
+# Listed import modules
+#-------------------------------------------------------------------------------------------------------- 
+from __future__ import division, print_function, absolute_import
+import json
+import sys
+import argparse
+import os
+import subprocess
+import time
+from datetime import datetime
+import requests
+import getopt
+import re
+import ssl
+import urllib
+
+try:
+    _create_unverified_https_context = ssl._create_unverified_context
+except AttributeError:
+    # Legacy Python that doesn't verify HTTPS certificates by default
+    pass
+else:
+    # Handle target environment that doesn't support HTTPS verification
+    ssl._create_default_https_context = _create_unverified_https_context
+
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+#--------------------------------------------------------------------------------------------------------
+# Create service - Input parameters
+#-------------------------------------------------------------------------------------------------------- 
+
+SUBDOMAIN='ABC'
+API_ACCESS_KEY='xxxxxxxxxxxxxxxxxxxxxxx'
+
+  
+# Source the Cloudcenter user env file to onboard service name	var
+SERVICECMD="source /usr/local/osmosix/etc/userenv;echo $CMDB_SERVICE_NAME"
+ENVCMD="source /usr/local/osmosix/etc/userenv;echo $CliqrDepEnvName"
+ESCGROUPCMD = "source /usr/local/osmosix/etc/userenv;echo $PD_ESCALATION_GROUP"
+
+#--------------------------------------------------------------------------------------------------------
+# Global message format
+#-------------------------------------------------------------------------------------------------------- 
+class global_config:
+    message_format = '[%d{%m/%d %H:%M:%S}, %s, %F, Line:%L] %m%n'
+
+
+class config(global_config):
+    severity = 'verbose'
+    
+def execute_cmd(cmd):
+    """
+    Executes shell command
+    :param cmd: command to be executed
+    :return: Output from executing command
+    """
+    return subprocess.check_output(str(cmd), shell=True)
+
+def agentSendLogMessage(msg):
+    """
+    Log message at CliQr UI
+    """
+    headers = {'Content-Type': 'text/plain',}
+    requests.post('http://localhost:port/agent/status/message', headers=headers, data=msg)
+    
+def parse_json_data(input_str):
+    """
+    Returns a dict object by parsing the input_str which is in json format
+    :param input_str: Input string
+    :return: a dict object
+    """
+    try:
+        return json.loads(input_str)
+    except ValueError:pass       
+            
+def main():
+
+    env = None
+    env=execute_cmd(ENVCMD).rstrip()
+    print("env:{0}".format(env))
+    SERVICENAME=execute_cmd(SERVICECMD).rstrip()
+    print("service name:{0}".format(SERVICENAME))
+    
+    CMDB_ID = env.rstrip() + '_' + SERVICENAME.rstrip()
+    print("cmdb id:{0}".format(CMDB_ID))
+    
+    ESCALATIONGROUP = execute_cmd(ESCGROUPCMD).rstrip()
+    print("Escalation group: {0}".format(ESCALATIONGROUP))
+    if ESCALATIONGROUP.upper() == "NONE" or not ESCALATIONGROUP:    
+        print("Exiting script - Not integrating service with PagerDuty as user selected NONE at PD_ESCALATION_GROUP while deployment")
+        agentSendLogMessage("pagerduty_add_service.py: Not integrating service - {0} with PagerDuty".format(CMDB_ID))
+        raise SystemExit()
+
+    
+    headers = {
+        'Authorization': 'Token token={0}'.format(API_ACCESS_KEY),
+        'Content-Type': 'application/json',
+        'Accept': 'application/vnd.pagerduty+json;version=2'
+    }
+
+    if ESCALATIONGROUP.upper() != "NONE":
+        esc_output = requests.get( 'https://api.pagerduty.com/escalation_policies?query={0}&sort_by=name'.format(ESCALATIONGROUP), headers=headers, verify=False)    
+        esc_response = parse_json_data(esc_output.text)
+        team_output = requests.get( 'https://api.pagerduty.com/teams?query={0}'.format(ESCALATIONGROUP), headers=headers, verify=False)   
+        team_response = parse_json_data(team_output.text)
+ 
+        if not team_response['teams']:
+            print("Exiting script : Team does not exist at PagerDuty. please set up team and an escalation policy manually first")
+            agentSendLogMessage("Exiting pagerduty_add_service.py : Team does not exist at PagerDuty. please set up team and an escalation policy manually.")
+            raise SystemExit()
+        else:
+            TEAM_ID = (team_response['teams'])[0]['id']
+            if not esc_response['escalation_policies']:
+                print("Exiting script: No default escalation policy found for team at PagerDuty. please create manually.")
+                agentSendLogMessage("Exiting pagerduty_add_service.py : No default escalation policy found for team at PagerDuty. please create manually.")
+                raise SystemExit()  
+            else:
+                ESCALATION_POLICY_ID =  (esc_response['escalation_policies'])[0]['id']
+                payload = json.dumps(
+                    {
+                      "service": {
+                        "type": "service",
+                        "name": "{0}".format(CMDB_ID),
+                        "description": "Non-Prod services related error alerts",   
+                        "status": "active",
+                        "auto_resolve_timeout": "",
+                        "acknowledgement_timeout": 1800,
+                        "alert_creation": "create_alerts_and_incidents",
+                        "escalation_policy": {
+                            "id":"{0}".format(ESCALATION_POLICY_ID),
+                            "type":"escalation_policy_reference"
+                        },
+                        "teams":[
+                            { 
+                                "type":"team_reference",
+                                "id":"{0}".format(TEAM_ID),
+                            }		
+                        ],          
+                        "incident_urgency_rule": {
+                            "type": "constant",
+                            "urgency": "high"
+                        }
+                      }
+                    }
+                )                   
+          
+
+#--------------------------------------------------------------------------------------------------------
+# Create service 
+#--------------------------------------------------------------------------------------------------------     
+
+
+    cmd_response = requests.post( 'https://api.pagerduty.com/services', headers=headers, data=payload, verify=False)
+        
+    cmd_json_output = cmd_response.json()
+    
+    print("Service Response status code : {0}".format(cmd_response.status_code))
+    print("Service Response text format : {0}".format(cmd_response.text))
+    
+    service_id = (cmd_json_output['service'])['id']
+    
+    
+    print("Created Service id : {0}".format(service_id))
+    agentSendLogMessage("pagerduty_add_service.py : Created Service id - {0}".format(service_id))
+#--------------------------------------------------------------------------------------------------------
+# Create email Integration id for SPLUNK 
+#--------------------------------------------------------------------------------------------------------    
+    
+    splunk_integration_payload = json.dumps(
+        {
+            "integration": {
+                "type": "generic_email_inbound_integration",
+                "name": "Email[Splunk]",
+                "service": {
+                    "id": service_id,
+                    "type": "service"
+                },
+                "integration_email": "{0}_splunk_{1}@pagerduty.com".format(SERVICENAME,env)
+            }
+        }  
+    )
+   
+
+    
+    if cmd_response.status_code in [200,201] and service_id <> "" :
+        splunk_int_response = requests.post(
+                        'https://api.pagerduty.com/services/{0}/integrations'.format(service_id),                                          
+                        headers=headers,
+                        data=splunk_integration_payload, verify=False
+                        )    
+
+        print("Splunk Integration Response  : {0}".format(splunk_int_response.text))
+        
+#--------------------------------------------------------------------------------------------------------
+# Create email Integration id for PROMETHEUS 
+#--------------------------------------------------------------------------------------------------------    
+    
+    prometheus_integration_payload = json.dumps(
+        {
+            "integration": {
+                "type": "generic_email_inbound_integration",
+                "name": "Email[Prometheus]",
+                "service": {
+                    "id": service_id,
+                    "type": "service"
+                },
+                "integration_email": "{0}_prometheus_{1}@pagerduty.com".format(SERVICENAME,env)
+            }
+        }  
+    )
+   
+
+    
+    if cmd_response.status_code in [200,201] and service_id <> "" :
+        prometheus_int_response = requests.post(
+                        'https://api.pagerduty.com/services/{0}/integrations'.format(service_id),                                          
+                        headers=headers,
+                        data=prometheus_integration_payload, verify=False
+                        )    
+
+        print("Prometheus Integration Response  : {0}".format(prometheus_int_response.text))
+        
+
+if __name__ == "__main__":
+    main()
