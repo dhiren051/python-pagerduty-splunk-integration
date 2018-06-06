@@ -1,0 +1,214 @@
+#!/usr/bin/env python
+
+
+#--------------------------------------------------------------------------------------------------------
+# Listed import modules
+#-------------------------------------------------------------------------------------------------------- 
+from __future__ import division, print_function, absolute_import
+import json
+import sys
+try:
+    sys.path.index('/base/python/lx-x86_64/anaconda2/lib/python2.7/site-packages') 
+except ValueError:
+    sys.path.append('/base/python/lx-x86_64/anaconda2/lib/python2.7/site-packages') 
+import argparse
+import os
+import subprocess
+import logger
+import time
+from datetime import datetime
+from json2html import *
+
+
+
+
+#--------------------------------------------------------------------------------------------------------
+# Global message format
+#-------------------------------------------------------------------------------------------------------- 
+class global_config:
+    message_format = '[%d{%m/%d %H:%M:%S}, %s, %F, Line:%L] %m%n'
+
+
+class config(global_config):
+    severity = 'verbose'
+
+
+def parse_json_data(input_str):
+    """
+    Returns a dict object by parsing the input_str which is in json format
+    :param input_str: Input string
+    :return: a dict object
+    """
+    return json.loads(input_str)
+
+
+def parse_cmdline_args():
+        """
+        This function parses the command line arguments.
+        :return: parsed list of arguments
+        """
+        parser = argparse.ArgumentParser(
+            description='This is a program to fetch details for escalation policies from pagerduty'
+                        'and then dump details into file')
+        parser.add_argument('--working-dir', '-w', dest='working_dir', 
+                            help="Please specify the working dir")
+        parser.add_argument('--invocation-id', '-i', dest='invocation_id', required=True,
+                            help="Please specify the invocation-id")
+        parser.add_argument('--run-id', '-r', dest='run_id', required=True,
+                            help="Please specify the run_id")
+        parser.add_argument('--log-date', '-d', dest='log_date', required=True,
+                            help="Please specify the log_date")
+        parser.add_argument('--filter_by', '-f', dest='filter_by',
+                            help="Please specify filter to export escalation policies by team names")
+        args = parser.parse_args()
+        return args
+
+
+def execute_cmd(cmd):
+    """
+    Executes shell command
+    :param cmd: command to be executed
+    :return: Output from executing command
+    """
+    return subprocess.check_output(str(cmd), shell=True)
+
+
+def write_output(data, service_name, working_dir):
+    """
+    Writes data to json file for given service name into the working directory.
+    :return: None
+    """
+    if not os.path.exists(working_dir):
+		os.makedirs(working_dir)
+      #  logger.info("Directory created at : {0}".format(working_dir))
+    else:
+	    logger.info("Directory already exists at : {0}".format(working_dir))
+    #print working_dir
+    
+    file_path = os.path.join(working_dir, "{0}.json".format(service_name.replace(" ", "_")))
+    with open(file_path, 'w') as output_file:
+        output_file.write(json.dumps(data, indent=3, sort_keys=True))
+    logger.info("Data written to file successfully for policy --> {0} to --> {1}".format(service_name, file_path))
+    
+def write_output_html(data, service_name, working_dir):
+    """
+    Writes data to json file for given service name into the working directory.
+    :return: None
+    """
+    if not os.path.exists(working_dir):
+		os.makedirs(working_dir)
+      #  logger.info("Directory created at : {0}".format(working_dir))
+    else:
+	    logger.info("Directory already exists at : {0}".format(working_dir))
+    #print working_dir
+    
+    file_path = os.path.join(working_dir, "{0}.html".format(service_name.replace(" ", "_")))
+    with open(file_path, 'w') as output_file:
+        output_file.write(data)
+    logger.info("Data written to file successfully for policy --> {0} to --> {1}".format(service_name, file_path))    
+
+
+            
+def delete_keys_from_dict(json_input, lst_keys):
+        for k in lst_keys:
+            try:
+                del json_input[k]
+            except KeyError:
+                pass
+        for v in json_input.values():
+            if isinstance(v, dict):
+                delete_keys_from_dict(json_input, lst_keys)
+            if isinstance(v, list):
+                for each in v: 
+                    if isinstance(v, dict):
+                        delete_keys_from_dict(json_input, lst_keys)
+                    if isinstance(v, list):
+                        for each in v:   
+                            delete_keys_from_dict(each, lst_keys)
+
+        return json_input    
+
+        
+def main():
+    arguments = parse_cmdline_args()
+    logger.info("Arguments: {0}".format(arguments))
+    
+    
+    
+    
+#--------------------------------------------------------------------------------------------------------
+# Process command line arguments
+#--------------------------------------------------------------------------------------------------------
+    date  = arguments.log_date
+    if arguments.working_dir:
+	    working_dir = arguments.working_dir
+    else:
+        working_dir = format(os.path.join(os.getenv('FILE_BACKUP_DIR'),"runtime",arguments.invocation_id,date,arguments.run_id))
+        logger.info ("Setting Working Directory as per default")
+	
+    logger.info("Working directory => {0}".format(working_dir))
+    
+#--------------------------------------------------------------------------------------------------------
+# Pagerduty API url 
+#-------------------------------------------------------------------------------------------------------- 
+    if arguments.filter_by == 'teams' :
+        all_escalation_policies_cmd = "curl -s -X GET --header 'Accept: application/vnd.pagerduty+json;version=2'" \
+                            " --header 'Authorization: Token token=xxxxxxxxxxxxxxxxxxxxxxx' " \
+                            "'https://api.pagerduty.com/teams?limit=100' "
+        logger.info("Filtered by => {0}".format(arguments.filter_by))                    
+    else:
+        all_escalation_policies_cmd = "curl -s -X GET --header 'Accept: application/vnd.pagerduty+json;version=2'" \
+                            " --header 'Authorization: Token token=xxxxxxxxxxxxxxxxxxxxxxx' " \
+                            "'https://api.pagerduty.com/escalation_policies?sort_by=name&limit=100' "
+        logger.info("Setting filter with escalations as per default")
+
+    logger.info("Executing command: {0}".format(all_escalation_policies_cmd))
+    output_str = execute_cmd(all_escalation_policies_cmd)
+    
+    
+#--------------------------------------------------------------------------------------------------------
+# Fetching PD json data via API
+#-------------------------------------------------------------------------------------------------------- 
+    parsed_data = parse_json_data(output_str)
+
+#--------------------------------------------------------------------------------------------------------
+# Export all escalation policies in jsonv viewer format at   full path/[exec date]/[run id]  
+#--------------------------------------------------------------------------------------------------------    
+      
+    
+    if arguments.filter_by == 'teams':    
+                                 
+        for policy in parsed_data['teams']:
+            logger.info("")          
+            logger.info("Team ID --> {0}, Team Name --> {1}".format(policy["id"], policy["name"]))
+            policy_cmd = "curl -s -X GET --header 'Accept: application/vnd.pagerduty+json;version=2'" \
+                       " --header 'Authorization: Token token=xxxxxxxxxxxxxxxxxxxxxxx' " \
+                       "'https://api.pagerduty.com/escalation_policies?team_ids%5B%5D={0}'".format(policy['id'])         
+            policy_details_str = execute_cmd(policy_cmd)
+            logger.info("Executing command: {0}".format(policy_cmd))            
+            json_input = dict(parse_json_data(policy_details_str))
+			# filtering out certain not required columns
+            if not json_input['escalation_policies']:
+                continue
+            lst_keys = ['total','more','offset','limit','self','num_loops','id','type','privilege','teams','name']
+            delete_keys_from_dict(json_input, lst_keys) 
+            lst_keys = ['self','type']
+            delete_keys_from_dict(json_input, lst_keys)
+            html_string = json2html.convert(json_input)
+            
+            write_output_html( html_string, policy['name'], working_dir )
+    else:
+        for policy in parsed_data['escalation_policies']:
+            logger.info("")
+            logger.info("Policy ID --> {0}, Policy Name --> {1}".format(policy["id"], policy["name"]))
+            policy_cmd = "curl -s -X GET --header 'Accept: application/vnd.pagerduty+json;version=2'" \
+                   " --header 'Authorization: Token token=xxxxxxxxxxxxxxxxxxxxxxx' " \
+                   "'https://api.pagerduty.com/escalation_policies/{0}'".format(policy['id'])
+            policy_details_str = execute_cmd(policy_cmd)
+            logger.info("Executing command: {0}".format(policy_cmd))
+            write_output(parse_json_data(policy_details_str), policy['name'], working_dir  )
+
+
+
+if __name__ == "__main__":
+    main()
